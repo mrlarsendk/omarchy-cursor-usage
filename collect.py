@@ -19,8 +19,10 @@ import argparse
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -39,6 +41,74 @@ DEFAULT_STATE_DB = Path.home() / ".config" / "Cursor" / "User" / "globalStorage"
 DEFAULT_AUTH_JSON = Path.home() / ".config" / "cursor" / "auth.json"
 EVENTS_PAGE_SIZE = 200
 EVENTS_MAX_PAGES = 40
+MAX_RESPONSE_BYTES = 1_000_000
+MAX_TIER_LABEL = 32
+MAX_MODEL_LABEL = 64
+MAX_HELP_TEXT = 200
+MAX_MODELS = 24
+# Qt Text defaults to AutoText and will fetch <img>/<a> resources. Display
+# strings from Cursor must stay plain and short before they reach QML.
+_UNSAFE_LABEL = re.compile(r"[^A-Za-z0-9._:+/# \-]+")
+_URLISH = re.compile(r"(?i)\b(?:https?|file|qrc|ftp):/[^\s]*")
+_HTML_TAG = re.compile(r"<[^>]*>")
+
+
+class RejectRedirects(urllib.request.HTTPRedirectHandler):
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    # urllib keeps Authorization on 301/302/303, including cross-origin.
+    # Dashboard calls must not follow a Location with the session token.
+    return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(RejectRedirects())
+
+
+def dashboard_urlopen(request, timeout=None):
+  return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+
+
+def read_body(fp, limit: int = MAX_RESPONSE_BYTES) -> bytes:
+  if fp is None:
+    return b""
+  chunk = fp.read(limit + 1)
+  if len(chunk) > limit:
+    raise ValueError("response too large")
+  return chunk
+
+
+def safe_text(value: Any, limit: int = MAX_HELP_TEXT, fallback: str = "") -> str:
+  text = str(value or "")
+  text = _HTML_TAG.sub(" ", text)
+  text = "".join(
+    " " if unicodedata.category(ch)[0] == "C" and ch not in "\t\n" else ch
+    for ch in text
+  )
+  text = text.replace("<", " ").replace(">", " ")
+  text = " ".join(text.split())
+  if not text:
+    return fallback
+  if len(text) > limit:
+    return text[: limit - 1] + "…"
+  return text
+
+
+def safe_label(value: Any, limit: int = MAX_MODEL_LABEL, fallback: str = "unknown") -> str:
+  text = safe_text(value, limit=limit * 2, fallback="")
+  text = _URLISH.sub("", text)
+  text = _UNSAFE_LABEL.sub(" ", text)
+  text = " ".join(text.split())
+  if not text:
+    return fallback
+  if len(text) > limit:
+    return text[: limit - 1] + "…"
+  return text
+
+
+def trim_models(usage: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
+  if len(usage) <= MAX_MODELS:
+    return usage
+  ranked = sorted(usage.items(), key=lambda item: token_total(item[1]), reverse=True)
+  return dict(ranked[:MAX_MODELS])
 STATS_KEYS = (
   "todayPrompts",
   "todaySessions",
@@ -159,7 +229,7 @@ def load_credentials_from_state_db(state_db: Path) -> tuple[dict[str, str | None
   except sqlite3.Error as exc:
     return None, empty_result(
       usageStatusText="Cursor unavailable",
-      authHelpText=f"Could not open Cursor database: {exc}",
+      authHelpText="Could not open Cursor database.",
     )
 
   try:
@@ -169,7 +239,7 @@ def load_credentials_from_state_db(state_db: Path) -> tuple[dict[str, str | None
   except sqlite3.Error as exc:
     return None, empty_result(
       usageStatusText="Cursor unavailable",
-      authHelpText=f"Could not read Cursor database: {exc}",
+      authHelpText="Could not read Cursor database.",
     )
   finally:
     conn.close()
@@ -189,7 +259,7 @@ def load_credentials_from_auth_json(auth_json: Path) -> tuple[dict[str, str | No
   except Exception as exc:
     return None, empty_result(
       usageStatusText="Cursor unavailable",
-      authHelpText=f"Could not read Cursor auth file: {exc}",
+      authHelpText="Could not read Cursor auth file.",
     )
 
   if not isinstance(payload, dict):
@@ -287,7 +357,8 @@ def format_tier(value: Any) -> str:
   text = str(value or "").strip()
   if not text:
     return ""
-  return " ".join(part.capitalize() for part in text.replace("_", " ").split())
+  titled = " ".join(part.capitalize() for part in text.replace("_", " ").split())
+  return safe_label(titled, MAX_TIER_LABEL, fallback="")
 
 
 def percent_to_fraction(value: Any) -> float:
@@ -328,8 +399,8 @@ def local_date_from_epoch_ms(ms: int) -> str:
 
 
 def model_label(raw: Any) -> str:
-  text = str(raw or "").strip() or "unknown"
-  if text in ("default", "auto"):
+  text = safe_label(raw, MAX_MODEL_LABEL)
+  if text.lower() in ("default", "auto"):
     return "Auto"
   return text
 
@@ -351,25 +422,38 @@ def api_post(
     },
   )
   try:
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-      raw = response.read().decode("utf-8", errors="replace")
+    with dashboard_urlopen(request, timeout=timeout) as response:
+      raw = read_body(response).decode("utf-8", errors="replace")
       status = getattr(response, "status", 200)
   except urllib.error.HTTPError as exc:
     status = exc.code
-    raw = exc.read().decode("utf-8", errors="replace")
+    try:
+      read_body(exc)
+    except ValueError:
+      pass
     if status in (401, 403):
       return None, empty_result(
         usageStatusText="Sign in to Cursor",
         authHelpText="Cursor session expired. Open Cursor and sign in again, or run `cursor-agent login`.",
       )
+    if 300 <= status < 400:
+      return None, empty_result(
+        usageStatusText="Cursor limits unavailable",
+        authHelpText="Usage API returned an unexpected redirect.",
+      )
     return None, empty_result(
       usageStatusText="Cursor limits unavailable",
       authHelpText=f"Usage API returned HTTP {status}",
     )
-  except Exception as exc:
+  except ValueError:
     return None, empty_result(
       usageStatusText="Cursor limits unavailable",
-      authHelpText=str(exc),
+      authHelpText="Usage API response was too large.",
+    )
+  except Exception:
+    return None, empty_result(
+      usageStatusText="Cursor limits unavailable",
+      authHelpText="Could not reach Cursor usage API.",
     )
 
   if status < 200 or status >= 300:
@@ -587,13 +671,13 @@ def build_stats_from_events(
       "todayPrompts": today_prompts,
       "todaySessions": len(today_conversations),
       "todayTotalTokens": today_total,
-      "todayTokensByModel": today_tokens,
+      "todayTokensByModel": dict(sorted(today_tokens.items(), key=lambda item: item[1], reverse=True)[:MAX_MODELS]),
       "recentDays": [recent[day] for day in recent_dates],
       "totalPrompts": max(reported_total, len(events)),
       "totalSessions": len(conversations),
       "activeDays": len(active_dates),
       "activeDates": sorted(active_dates),
-      "modelUsage": model_usage,
+      "modelUsage": trim_models(model_usage),
     }
   )
   return stats
