@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mrlarsendk.cursor-usage",
+  "name": "Cursor Usage",
+  "version": "1.0.0",
+  "author": "mrlarsendk",
+  "license": "MIT",
+  "description": "Adds Cursor to Omarchy's existing AI toolbar widget (the stock AI icon), not a new bar icon.",
+  "kinds": ["service"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
