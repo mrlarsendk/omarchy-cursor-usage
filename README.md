@@ -4,6 +4,8 @@ Adds **Cursor** to Omarchy's **existing AI toolbar widget** — the AI icon alre
 
 After install, click that same AI button. You get a **Cursor** chip next to **Claude Code** (and Codex / Grok / Fireworks if you use them): plan meters (Included / Cursor Models / Other Models) and token charts from Cursor's dashboard APIs.
 
+![Cursor usage panel in Omarchy](assets/cursor-usage-panel.png)
+
 ## Install
 
 ```sh
