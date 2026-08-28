@@ -21,7 +21,9 @@ import math
 import os
 import re
 import sqlite3
+import stat
 import sys
+import tempfile
 import unicodedata
 import urllib.error
 import urllib.request
@@ -42,6 +44,7 @@ DEFAULT_AUTH_JSON = Path.home() / ".config" / "cursor" / "auth.json"
 EVENTS_PAGE_SIZE = 200
 EVENTS_MAX_PAGES = 40
 MAX_RESPONSE_BYTES = 1_000_000
+MAX_LOCAL_JSON_BYTES = 256_000
 MAX_TIER_LABEL = 32
 MAX_MODEL_LABEL = 64
 MAX_HELP_TEXT = 200
@@ -74,6 +77,56 @@ def read_body(fp, limit: int = MAX_RESPONSE_BYTES) -> bytes:
   if len(chunk) > limit:
     raise ValueError("response too large")
   return chunk
+
+
+def open_no_follow(path: Path) -> int | None:
+  """Open a path for reading without following a symlink at the last step.
+
+  Credentials, Cursor's database and our own cache all sit at fixed,
+  guessable paths another same-user process could swap between our check
+  and our use. O_NOFOLLOW refuses a planted symlink and O_NONBLOCK keeps
+  a planted FIFO from blocking the open. Returns None unless what we
+  opened is a plain file.
+  """
+  try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+  except OSError:
+    return None
+  try:
+    if stat.S_ISREG(os.fstat(fd).st_mode):
+      return fd
+  except OSError:
+    pass
+  os.close(fd)
+  return None
+
+
+def stat_no_follow(path: Path) -> os.stat_result | None:
+  fd = open_no_follow(path)
+  if fd is None:
+    return None
+  try:
+    return os.fstat(fd)
+  except OSError:
+    return None
+  finally:
+    os.close(fd)
+
+
+def read_local_file(path: Path, limit: int = MAX_LOCAL_JSON_BYTES) -> bytes | None:
+  """Read a local file we don't trust, under the same bound as a response.
+
+  Returns None whenever the path is missing, isn't a plain file, or runs
+  past the limit, so every caller can treat it as "nothing usable here".
+  """
+  fd = open_no_follow(path)
+  if fd is None:
+    return None
+  try:
+    with os.fdopen(fd, "rb") as fp:
+      return read_body(fp, limit)
+  except (OSError, ValueError):
+    return None
 
 
 def safe_text(value: Any, limit: int = MAX_HELP_TEXT, fallback: str = "") -> str:
@@ -131,11 +184,11 @@ def usage_record_path() -> Path:
 
 
 def load_cached_stats() -> dict[str, Any]:
-  path = usage_record_path()
-  if not path.is_file():
+  raw = read_local_file(usage_record_path())
+  if raw is None:
     return {}
   try:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(raw.decode("utf-8"))
   except Exception:
     return {}
   if not isinstance(data, dict):
@@ -217,26 +270,41 @@ def read_item(conn: sqlite3.Connection, key: str) -> str | None:
 
 
 def load_credentials_from_state_db(state_db: Path) -> tuple[dict[str, str | None] | None, dict[str, Any] | None]:
-  if not state_db.is_file():
+  before = stat_no_follow(state_db)
+  if before is None:
+    # Missing is the ordinary case (no Cursor IDE). Anything that isn't a
+    # plain file we decline to open at all. Either way this is "no IDE
+    # credentials", so fall through to the Cursor Agent ones as before.
     return None, None
+
+  unavailable = empty_result(
+    usageStatusText="Cursor unavailable",
+    authHelpText="Could not open Cursor database.",
+  )
 
   try:
     # Open read-only. mode=ro blocks writes through this connection; WAL/shm
     # sidecars may still exist from Cursor's writer. Avoid immutable=1 so a
-    # live DB with an active WAL remains readable.
-    uri = state_db.resolve().as_uri() + "?mode=ro"
+    # live DB with an active WAL remains readable. Pass the path as given,
+    # since resolve() would follow a symlink planted over the database, and
+    # sqlite needs the real directory to find those -wal/-shm sidecars.
+    uri = Path(os.path.abspath(state_db)).as_uri() + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=2)
-  except sqlite3.Error as exc:
-    return None, empty_result(
-      usageStatusText="Cursor unavailable",
-      authHelpText="Could not open Cursor database.",
-    )
+  except (sqlite3.Error, ValueError):
+    return None, unavailable
+
+  # sqlite resolves the path itself, so confirm it landed on the same file we
+  # just vetted rather than one swapped in behind us.
+  after = stat_no_follow(state_db)
+  if after is None or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+    conn.close()
+    return None, unavailable
 
   try:
     conn.execute("PRAGMA query_only = ON")
     access_token = read_item(conn, "cursorAuth/accessToken")
     membership = read_item(conn, "cursorAuth/stripeMembershipType")
-  except sqlite3.Error as exc:
+  except sqlite3.Error:
     return None, empty_result(
       usageStatusText="Cursor unavailable",
       authHelpText="Could not read Cursor database.",
@@ -251,12 +319,13 @@ def load_credentials_from_state_db(state_db: Path) -> tuple[dict[str, str | None
 
 
 def load_credentials_from_auth_json(auth_json: Path) -> tuple[dict[str, str | None] | None, dict[str, Any] | None]:
-  if not auth_json.is_file():
+  raw = read_local_file(auth_json)
+  if raw is None:
     return None, None
 
   try:
-    payload = json.loads(auth_json.read_text(encoding="utf-8"))
-  except Exception as exc:
+    payload = json.loads(raw.decode("utf-8"))
+  except Exception:
     return None, empty_result(
       usageStatusText="Cursor unavailable",
       authHelpText="Could not read Cursor auth file.",
@@ -722,10 +791,19 @@ def collect_record(access_token: str, membership: str | None, limits_only: bool)
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
   path.parent.mkdir(parents=True, exist_ok=True)
-  tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-  tmp.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8")
-  tmp.chmod(0o600)
-  tmp.replace(path)
+  body = json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"
+  # mkstemp gives an unpredictable name, created exclusively (a planted
+  # symlink is a collision, never followed) at mode 0600 from creation
+  # rather than chmod'd after the write.
+  fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+  tmp = Path(name)
+  try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fp:
+      fp.write(body)
+    tmp.replace(path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
 
 
 def main(argv: list[str] | None = None) -> int:
