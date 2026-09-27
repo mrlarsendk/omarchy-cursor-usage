@@ -44,6 +44,11 @@ This plugin is a headless service. It only writes a Cursor usage record for the 
 
 Plan meters come from Cursor's `GetCurrentPeriodUsage` / `GetPlanInfo` APIs. Day and model charts come from paged `GetFilteredUsageEvents`. Auth is read from the Cursor IDE `state.vscdb`, or from `~/.config/cursor/auth.json` after `cursor-agent login`.
 
+If a refresh cannot reach Cursor's API or read credentials, the panel shows
+the error and keeps the last recorded day/model/prompt statistics. It does not
+reuse old quota meters. This prevents a brief outage from hiding the Cursor
+tab; a machine with no recorded usage still shows no tab until collection succeeds.
+
 ## Remove
 
 ```sh

@@ -16,6 +16,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import collect
 
@@ -177,6 +178,42 @@ class CacheTest(TempDirTest):
     # file, not to constrain ordinary growth.
     self.assertGreater(collect.MAX_LOCAL_JSON_BYTES, 50 * 3570)
 
+
+  def test_temporary_usage_api_failure_keeps_the_cursor_tab_visible(self):
+    self.record.write_text(json.dumps({
+      "id": "cursor",
+      "totalPrompts": 42,
+      "totalSessions": 2,
+      "activeDays": 1,
+      "hasLocalStats": True,
+      "limits": [{"label": "Included total", "percent": 10}],
+    }))
+    failure = collect.empty_result(
+      usageStatusText="Cursor limits unavailable",
+      authHelpText="Could not reach Cursor usage API.",
+    )
+    with patch.object(collect, "load_credentials", return_value=({"accessToken": "test", "membershipType": "pro"}, None)):
+      with patch.object(collect, "fetch_period_usage", return_value=(None, failure)):
+        self.assertEqual(collect.main(["--write"]), 0)
+
+    record = json.loads(self.record.read_text())
+    self.assertEqual(record["usageStatusText"], "Cursor limits unavailable")
+    self.assertEqual(record["totalPrompts"], 42)
+    self.assertEqual(record["totalSessions"], 2)
+    self.assertEqual(record["limits"], [])  # Old live quota must not be shown as current.
+
+  def test_first_failed_refresh_has_no_cursor_tab(self):
+    failure = collect.empty_result(
+      usageStatusText="Cursor limits unavailable",
+      authHelpText="Could not reach Cursor usage API.",
+    )
+    with patch.object(collect, "load_credentials", return_value=({"accessToken": "test", "membershipType": "pro"}, None)):
+      with patch.object(collect, "fetch_period_usage", return_value=(None, failure)):
+        self.assertEqual(collect.main(["--write"]), 0)
+
+    record = json.loads(self.record.read_text())
+    self.assertEqual(record["totalPrompts"], 0)
+    self.assertEqual(record["limits"], [])
 
 class WriteJsonTest(TempDirTest):
   def test_writes_content_at_mode_0600(self):
