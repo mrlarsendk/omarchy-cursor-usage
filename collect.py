@@ -841,6 +841,11 @@ def main(argv: list[str] | None = None) -> int:
       args.limits_only,
     )
 
+  # A failed refresh must not erase history and make the panel hide Cursor.
+  # Keep only prior usage stats; expired/unreachable limits are not current.
+  if record.get("usageStatusText"):
+    record.update(load_cached_stats())
+
   if args.write:
     write_json(usage_record_path(), record)
   else:
